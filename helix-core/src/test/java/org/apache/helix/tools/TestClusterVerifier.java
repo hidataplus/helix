@@ -1,0 +1,159 @@
+package org.apache.helix.tools;
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import com.google.common.collect.Sets;
+import org.apache.helix.HelixAdmin;
+import org.apache.helix.TestHelper;
+import org.apache.helix.ZkUnitTestBase;
+import org.apache.helix.integration.manager.ClusterControllerManager;
+import org.apache.helix.integration.manager.MockParticipantManager;
+import org.apache.helix.model.BuiltInStateModelDefinitions;
+import org.apache.helix.model.IdealState;
+import org.apache.helix.model.IdealState.RebalanceMode;
+import org.apache.helix.tools.ClusterVerifiers.BestPossibleExternalViewVerifier;
+import org.apache.helix.tools.ClusterVerifiers.HelixClusterVerifier;
+import org.apache.helix.tools.ClusterVerifiers.StrictMatchExternalViewVerifier;
+import org.testng.Assert;
+import org.testng.annotations.AfterMethod;
+import org.testng.annotations.BeforeMethod;
+import org.testng.annotations.Test;
+
+import java.util.Arrays;
+
+public class TestClusterVerifier extends ZkUnitTestBase {
+  final String[] RESOURCES = {
+      "resource0", "resource1", "resource2", "resource3"
+  };
+  private HelixAdmin _admin;
+  private MockParticipantManager[] _participants;
+  private ClusterControllerManager _controller;
+  private String _clusterName;
+  private ClusterSetup _setupTool;
+
+  @BeforeMethod
+  public void beforeMethod() throws InterruptedException {
+    final int NUM_PARTITIONS = 10;
+    final int NUM_REPLICAS = 3;
+
+    // Cluster and resource setup
+    String className = TestHelper.getTestClassName();
+    String methodName = TestHelper.getTestMethodName();
+    _clusterName = className + "_" + methodName;
+    _setupTool = new ClusterSetup(ZK_ADDR);
+    _admin = _setupTool.getClusterManagementTool();
+    _setupTool.addCluster(_clusterName, true);
+    _setupTool.addResourceToCluster(_clusterName, RESOURCES[0], NUM_PARTITIONS,
+        BuiltInStateModelDefinitions.MasterSlave.name(), RebalanceMode.SEMI_AUTO.toString());
+    _setupTool.addResourceToCluster(_clusterName, RESOURCES[1], NUM_PARTITIONS,
+        BuiltInStateModelDefinitions.OnlineOffline.name(), RebalanceMode.SEMI_AUTO.toString());
+
+    _setupTool.addResourceToCluster(_clusterName, RESOURCES[2], NUM_PARTITIONS,
+        BuiltInStateModelDefinitions.MasterSlave.name(), RebalanceMode.FULL_AUTO.toString());
+    _setupTool.addResourceToCluster(_clusterName, RESOURCES[3], NUM_PARTITIONS,
+        BuiltInStateModelDefinitions.OnlineOffline.name(), RebalanceMode.FULL_AUTO.toString());
+
+    // Configure and start the participants
+    _participants = new MockParticipantManager[RESOURCES.length];
+    for (int i = 0; i < _participants.length; i++) {
+      String host = "localhost";
+      int port = 12918 + i;
+      String id = host + '_' + port;
+      _setupTool.addInstanceToCluster(_clusterName, id);
+      _participants[i] = new MockParticipantManager(ZK_ADDR, _clusterName, id);
+      _participants[i].syncStart();
+    }
+
+    // Rebalance the resources
+    for (int i = 0; i < RESOURCES.length; i++) {
+      _setupTool.rebalanceResource(_clusterName, RESOURCES[i], NUM_REPLICAS);
+    }
+
+    // Start the controller
+    _controller = new ClusterControllerManager(ZK_ADDR, _clusterName, "controller_0");
+    _controller.syncStart();
+    Thread.sleep(1000);
+  }
+
+  @AfterMethod
+  public void afterMethod() {
+    // Cleanup
+    _controller.syncStop();
+    for (MockParticipantManager participant : _participants) {
+      participant.syncStop();
+    }
+    _admin.dropCluster(_clusterName);
+  }
+
+  @Test
+  public void testEntireCluster() throws InterruptedException {
+    // Just ensure that the entire cluster passes
+    // ensure that the external view coalesces
+    HelixClusterVerifier bestPossibleVerifier =
+        new BestPossibleExternalViewVerifier.Builder(_clusterName).setZkClient(_gZkClient).build();
+    Assert.assertTrue(bestPossibleVerifier.verify(10000));
+
+    HelixClusterVerifier strictMatchVerifier =
+        new StrictMatchExternalViewVerifier.Builder(_clusterName).setZkClient(_gZkClient).build();
+    Assert.assertTrue(strictMatchVerifier.verify(10000));
+
+    _participants[0].syncStop();
+    Thread.sleep(1000);
+    Assert.assertFalse(strictMatchVerifier.verify(10000));
+  }
+
+  @Test public void testResourceSubset() throws InterruptedException {
+    String testDB = "resource-testDB";
+    _setupTool.addResourceToCluster(_clusterName, testDB, 1,
+        BuiltInStateModelDefinitions.MasterSlave.name(), RebalanceMode.SEMI_AUTO.toString());
+
+    IdealState idealState = _admin.getResourceIdealState(_clusterName, testDB);
+    idealState.setReplicas(Integer.toString(2));
+    idealState.getRecord().setListField(testDB + "_0",
+        Arrays.asList(_participants[1].getInstanceName(), _participants[2].getInstanceName()));
+    _admin.setResourceIdealState(_clusterName, testDB, idealState);
+
+    // Ensure that this passes even when one resource is down
+    _admin.enableInstance(_clusterName, "localhost_12918", false);
+    Thread.sleep(1000);
+    _admin.enableCluster(_clusterName, false);
+    _admin.enableInstance(_clusterName, "localhost_12918", true);
+
+    HelixClusterVerifier verifier =
+        new BestPossibleExternalViewVerifier.Builder(_clusterName).setZkClient(_gZkClient)
+            .setResources(Sets.newHashSet(testDB)).build();
+    Assert.assertTrue(verifier.verify());
+
+    verifier = new StrictMatchExternalViewVerifier.Builder(_clusterName).setZkClient(_gZkClient)
+        .setResources(Sets.newHashSet(testDB)).build();
+    Assert.assertTrue(verifier.verify());
+
+    // But the full cluster verification should fail
+    verifier =
+        new BestPossibleExternalViewVerifier.Builder(_clusterName).setZkClient(_gZkClient).build();
+    Assert.assertFalse(verifier.verify());
+
+    verifier =
+        new StrictMatchExternalViewVerifier.Builder(_clusterName).setZkClient(_gZkClient).build();
+    Assert.assertFalse(verifier.verify());
+
+    _admin.enableCluster(_clusterName, true);
+  }
+}
